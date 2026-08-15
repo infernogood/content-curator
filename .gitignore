@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Временные файлы и БД
+data/
+tmp/
+*.db
+*.sqlite3
+
+# Конфигурации и секреты
+.env
+.opencode/
+.idea/
+.vscode/
