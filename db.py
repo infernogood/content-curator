@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import hashlib
 import sqlite3
 from contextlib import contextmanager
@@ -44,13 +42,13 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime(DATETIME_ISO)
 
 
-_SCHEMA = """
+_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     telegram_id   INTEGER NOT NULL UNIQUE,
     username      TEXT NOT NULL DEFAULT '',
     full_name     TEXT NOT NULL DEFAULT '',
-    status        TEXT NOT NULL DEFAULT 'pending',   -- pending | active | blocked
+    status        TEXT NOT NULL DEFAULT '{USER_STATUS_PENDING}',
     is_super_admin INTEGER NOT NULL DEFAULT 0,
     created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -74,7 +72,7 @@ CREATE TABLE IF NOT EXISTS sources (
     identifier      TEXT NOT NULL,
     title           TEXT NOT NULL DEFAULT '',
     enabled         INTEGER NOT NULL DEFAULT 1,
-    extra           TEXT NOT NULL DEFAULT '{}',
+    extra           TEXT NOT NULL DEFAULT '{{}}',
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     last_fetched_at TEXT
 );
@@ -89,9 +87,9 @@ CREATE TABLE IF NOT EXISTS posts (
     raw_text        TEXT NOT NULL DEFAULT '',
     translated_text TEXT NOT NULL DEFAULT '',
     media_file_id   TEXT,
-    media_type      TEXT NOT NULL DEFAULT 'text',
+    media_type      TEXT NOT NULL DEFAULT '{MEDIA_TYPE_TEXT}',
     rating          INTEGER NOT NULL DEFAULT 0,
-    status          TEXT NOT NULL DEFAULT 'draft',
+    status          TEXT NOT NULL DEFAULT '{POST_STATUS_DRAFT}',
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     published_at    TEXT
 );

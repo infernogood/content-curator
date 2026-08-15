@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import html
 import json
 import logging
@@ -9,13 +7,14 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable, Protocol
 
 import feedparser
 import requests
 
 import db
 import keyboards
+import texts
 from config import (
     DEFAULT_DOWNLOAD_UA,
     MEDIA_TYPE_ANIMATION,
@@ -36,6 +35,18 @@ from config import (
 )
 
 log = logging.getLogger(__name__)
+
+LLM_RAW_TEXT_LIMIT = 8000
+LLM_SUMMARY_LIMIT = 2000
+
+
+class MediaSender(Protocol):
+    """Клиент Telegram, умеющий отправлять пост с медиа и возвращать file_id."""
+
+    def send_new_post(
+        self, chat_id, caption: str, media_path_or_id, reply_markup: dict | None = None,
+    ) -> str | None:
+        ...
 
 
 MIME_TO_EXT: dict[str, str] = {
@@ -163,7 +174,7 @@ def analyze(user_id: int, raw_text: str) -> tuple[int, str]:
     model = db.get_effective(user_id, SETTING_AI_MODEL, "glm-4-flash")
     prompt = db.get_effective(user_id, SETTING_SYSTEM_PROMPT, "")
 
-    content = _llm_chat(base_url, api_key, model, prompt, raw_text[:8000], temperature=0.3)
+    content = _llm_chat(base_url, api_key, model, prompt, raw_text[:LLM_RAW_TEXT_LIMIT], temperature=0.3)
     return _parse_analysis(content)
 
 
@@ -175,11 +186,10 @@ def _try_parse_json(text: str) -> dict | None:
             cleaned = cleaned[len("json"):].lstrip()
     start = cleaned.find("{")
     end = cleaned.rfind("}")
-    if start == -1 or end == -1 or end <= start:
+    if start == -1 or end <= start:
         return None
-    cleaned = cleaned[start:end + 1]
     try:
-        parsed = json.loads(cleaned, strict=False)
+        parsed = json.loads(cleaned[start:end + 1], strict=False)
         return parsed if isinstance(parsed, dict) else None
     except ValueError:
         return None
@@ -209,7 +219,7 @@ def _parse_analysis(content: str) -> tuple[int, str]:
     if parsed is not None:
         rating = parse_int(parsed.get("rating"), fallback=0)
         rating = max(0, min(rating, 10))
-        summary = str(parsed.get("summary") or "").strip()[:2000]
+        summary = str(parsed.get("summary") or "").strip()[:LLM_SUMMARY_LIMIT]
         return rating, summary
 
     first_line = content.strip().splitlines()[0] if content.strip() else ""
@@ -218,7 +228,7 @@ def _parse_analysis(content: str) -> tuple[int, str]:
         rating = parse_int(match.group(1))
         rating = max(0, min(rating, 10))
         summary = content[len(first_line):].strip() or content.strip()
-        return rating, summary[:2000]
+        return rating, summary[:LLM_SUMMARY_LIMIT]
 
     log.warning("LLM-ответ не распарсен: %r", content[:200])
     return 0, ""
@@ -312,7 +322,7 @@ def process_collected(
     owner_id: int,
     collected: CollectedItem,
     moderation_kb_factory: Callable[[int], dict] | None,
-    bot_client: Any,  # telegram-объект с send_new_post
+    tg: MediaSender,
 ) -> int | None:
     dedup_hash = db.make_dedup_hash(collected.source_url, collected.raw_text)
     if db.exists_by_hash(owner_id, dedup_hash):
@@ -356,14 +366,17 @@ def process_collected(
                 pid, status=POST_STATUS_DRAFT, has_prev=False, has_next=False, offset=0,
             )
 
+        summary_shown = summary
+        if media_path is not None and len(summary_shown) > texts.MAX_CAPTION_LEN - 100:
+            summary_shown = summary_shown[:texts.MAX_CAPTION_LEN - 101].rstrip("&") + "…"
         caption = (
             f"<b>Новый черновик</b>  ·  {rating}/10\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"{html.escape(summary)}\n"
+            f"{html.escape(summary_shown)}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"ID #{post['id']}"
         )
-        file_id = bot_client.send_new_post(
+        file_id = tg.send_new_post(
             user["telegram_id"], caption, media_path, moderation_kb_factory(post["id"])
         )
         if file_id:
@@ -376,7 +389,7 @@ def process_collected(
         cleanup(media_path)
 
 
-def run_collection(bot_client) -> int:
+def run_collection(tg: MediaSender) -> int:
     created_total = 0
     now = datetime.now(timezone.utc)
     users = db.list_active_users()
@@ -416,7 +429,7 @@ def run_collection(bot_client) -> int:
 
             for collected in entries:
                 try:
-                    post_id = process_collected(user["id"], collected, None, bot_client)
+                    post_id = process_collected(user["id"], collected, None, tg)
                     if post_id is not None:
                         created_total += 1
                 except Exception:

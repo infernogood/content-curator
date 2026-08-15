@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from config import (
     POST_STATUS_ARCHIVED,
     POST_STATUS_DRAFT,

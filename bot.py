@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import html
 import json
 import logging
@@ -36,6 +34,7 @@ from config import (
 log = logging.getLogger(__name__)
 
 API_BASE = "https://api.telegram.org/bot{token}/{method}"
+CALLBACK_ALERT_MAX_LEN = 200
 
 
 class Telegram:
@@ -105,7 +104,7 @@ class Telegram:
     def answer_callback(self, cb_id: str, text: str | None = None, show_alert: bool = False) -> None:
         payload: dict[str, Any] = {"callback_query_id": cb_id}
         if text:
-            payload["text"] = text[:200]
+            payload["text"] = text[:CALLBACK_ALERT_MAX_LEN]
         if show_alert:
             payload["show_alert"] = True
         self._request("answerCallbackQuery", payload)
@@ -136,6 +135,8 @@ class Telegram:
         MEDIA_TYPE_ANIMATION: ("sendAnimation", MEDIA_TYPE_ANIMATION),
         MEDIA_TYPE_DOCUMENT: ("sendDocument", MEDIA_TYPE_DOCUMENT),
     }
+
+    MEDIA_TYPES = frozenset(_MEDIA)
 
     def send_media(
         self, chat_id, media_path_or_id, media_type: str, caption: str | None = None,
@@ -182,15 +183,22 @@ def _is_active(user: dict | None) -> bool:
     return bool(user and user["status"] == USER_STATUS_ACTIVE)
 
 
+def _resolve_user(tg_user: dict) -> tuple[dict, bool]:
+    is_super = tg_user["id"] in ADMIN_IDS
+    user = db.upsert_user(
+        tg_user["id"], tg_user.get("username", "") or "", texts.full_name(tg_user), is_super,
+    )
+    return user, is_super
+
+
 def _has_media(post: dict) -> bool:
-    return bool(post["media_file_id"] and post["media_type"] in (
-        MEDIA_TYPE_PHOTO, MEDIA_TYPE_VIDEO, MEDIA_TYPE_ANIMATION, MEDIA_TYPE_DOCUMENT,
-    ))
+    return bool(post["media_file_id"] and post["media_type"] in Telegram.MEDIA_TYPES)
 
 
 def _send_post_card(tg: Telegram, chat_id: int, post: dict, status: str, offset: int, total: int) -> None:
     source = db.get_source(post["owner_id"], post["source_id"]) if post["source_id"] else None
-    caption = texts.render_post_caption(post, source)
+    limit = texts.MAX_CAPTION_LEN if _has_media(post) else texts.MAX_TEXT_LEN
+    caption = texts.render_post_caption(post, source, limit)
     kb = keyboards.post_card_kb(
         post["id"], status=status, offset=offset,
         has_prev=offset > 0, has_next=offset < total - 1,
@@ -201,10 +209,18 @@ def _send_post_card(tg: Telegram, chat_id: int, post: dict, status: str, offset:
         tg.send_message(chat_id, caption, kb)
 
 
-def _open_settings(tg: Telegram, chat: int, user: dict) -> None:
+def _open_kv_editor(
+    tg: Telegram, chat: int, user: dict,
+    pairs: list[tuple[str, str]],
+    render_fn: Callable[[list[tuple[str, str]]], str],
+    kb_fn: Callable[[], dict],
+    preview_len: int | None = None,
+) -> None:
     rows = []
-    for key, label in texts.EDITABLE_SETTINGS:
+    for key, label in pairs:
         value = db.get_effective(user["id"], key, "")
+        if preview_len is not None and len(value) > preview_len:
+            value = value[:preview_len] + "…"
         if key in texts.SECRET_KEYS:
             shown = html.escape(texts.mask(value))
         elif value:
@@ -212,17 +228,22 @@ def _open_settings(tg: Telegram, chat: int, user: dict) -> None:
         else:
             shown = "<i>(пусто)</i>"
         rows.append((label, shown))
-    tg.send_message(chat, texts.settings_overview(rows), keyboards.settings_menu_kb())
+    tg.send_message(chat, render_fn(rows), kb_fn())
+
+
+def _open_settings(tg: Telegram, chat: int, user: dict) -> None:
+    _open_kv_editor(
+        tg, chat, user,
+        texts.EDITABLE_SETTINGS, texts.settings_overview, keyboards.settings_menu_kb,
+    )
 
 
 def _open_prompts(tg: Telegram, chat: int, user: dict) -> None:
-    rows = []
-    for key, label in texts.EDITABLE_PROMPTS:
-        value = db.get_effective(user["id"], key, "")
-        preview = (value[:80] + "…") if len(value) > 80 else value
-        shown = html.escape(preview) if preview else "<i>(пусто)</i>"
-        rows.append((label, shown))
-    tg.send_message(chat, texts.prompts_overview(rows), keyboards.prompts_menu_kb())
+    _open_kv_editor(
+        tg, chat, user,
+        texts.EDITABLE_PROMPTS, texts.prompts_overview, keyboards.prompts_menu_kb,
+        preview_len=texts.PREVIEW_LEN,
+    )
 
 
 def _open_content_base(tg: Telegram, chat: int, user: dict) -> None:
@@ -263,10 +284,7 @@ def handle_message(tg: Telegram, msg: dict, fsms: dict) -> None:
     chat = msg["chat"]["id"]
     text = (msg.get("text") or "").strip()
 
-    is_super = tg_user["id"] in ADMIN_IDS
-    user = db.upsert_user(
-        tg_user["id"], tg_user.get("username", "") or "", texts.full_name(tg_user), is_super,
-    )
+    user, _ = _resolve_user(tg_user)
     tg_id = user["telegram_id"]
 
     if text == "/start":
@@ -384,10 +402,7 @@ def handle_callback(tg: Telegram, cb: dict, fsms: dict) -> None:
     cb_id = cb["id"]
     callback_value = cb.get("data", "")
 
-    is_super = tg_user["id"] in ADMIN_IDS
-    user = db.upsert_user(
-        tg_user["id"], tg_user.get("username", "") or "", texts.full_name(tg_user), is_super,
-    )
+    user, _ = _resolve_user(tg_user)
 
     if not _is_active(user):
         tg.answer_callback(cb_id, texts.ACCESS_DENIED, show_alert=True)
@@ -475,12 +490,16 @@ def _publish_post(
         tg.answer_callback(cb_id, texts.POST_NOT_FOUND, show_alert=True)
         return
 
-    if _has_media(post):
+    text = post["translated_text"] or ""
+    has_media = _has_media(post)
+    if has_media and len(text) > texts.MAX_CAPTION_LEN:
+        text = text[:texts.MAX_CAPTION_LEN - 1].rstrip("&") + "…"
+    if has_media:
         published = tg.send_media(
-            channel_id, post["media_file_id"], post["media_type"], html.escape(post["translated_text"] or ""),
+            channel_id, post["media_file_id"], post["media_type"], html.escape(text),
         ) is not None
     else:
-        published = tg.send_message(channel_id, html.escape(post["translated_text"] or "")) is not None
+        published = tg.send_message(channel_id, html.escape(text)) is not None
 
     if not published:
         tg.answer_callback(cb_id, texts.PUBLISH_FAILED, show_alert=True)
@@ -568,47 +587,59 @@ def _handle_src(
         return
 
 
-def _handle_set(
-    tg: Telegram, chat: int, message_id: int, cb_id: str,
-    user: dict, segments: list[str], fsms: dict,
-) -> None:
-    key = segments[1]
-    label = dict(texts.EDITABLE_SETTINGS).get(key)
-    if label is None:
-        tg.answer_callback(cb_id, texts.UNKNOWN_SETTING, show_alert=True)
-        return
-
-    hint = ""
+def _kv_setting_hint(key: str) -> str:
     if key in texts.SECRET_KEYS:
-        hint = texts.SECRET_VALUE_HINT
-    elif key == SETTING_AI_BASE_URL:
-        hint = texts.BASE_URL_HINT
+        return texts.SECRET_VALUE_HINT
+    if key == SETTING_AI_BASE_URL:
+        return texts.BASE_URL_HINT
+    return ""
 
-    fsms[user["telegram_id"]] = {
+
+KV_CALLBACKS: dict[str, dict[str, Any]] = {
+    "set": {
+        "pairs": texts.EDITABLE_SETTINGS,
         "state": "set_wait",
-        "state_data": {"key": key, "label": label},
         "back": "settings",
-    }
-    tg.answer_callback(cb_id)
-    tg.send_message(chat, texts.setting_prompt(label, hint), keyboards.cancel_kb())
+        "unknown": texts.UNKNOWN_SETTING,
+        "prompt": texts.setting_prompt,
+        "hint": _kv_setting_hint,
+    },
+    "prm": {
+        "pairs": texts.EDITABLE_PROMPTS,
+        "state": "prm_wait",
+        "back": "prompts",
+        "unknown": texts.UNKNOWN_PROMPT,
+        "prompt": texts.prompt_prompt,
+        "hint": None,
+    },
+}
 
 
-def _handle_prm(
+def _handle_kv_edit(
     tg: Telegram, chat: int, message_id: int, cb_id: str,
     user: dict, segments: list[str], fsms: dict,
 ) -> None:
-    key = segments[1]
-    label = dict(texts.EDITABLE_PROMPTS).get(key)
-    if label is None:
-        tg.answer_callback(cb_id, texts.UNKNOWN_PROMPT, show_alert=True)
+    config = KV_CALLBACKS.get(segments[0])
+    if config is None:
+        tg.answer_callback(cb_id)
         return
+
+    key = segments[1]
+    label = dict(config["pairs"]).get(key)
+    if label is None:
+        tg.answer_callback(cb_id, config["unknown"], show_alert=True)
+        return
+
+    hint_builder = config["hint"]
+    hint = hint_builder(key) if hint_builder else ""
+
     fsms[user["telegram_id"]] = {
-        "state": "prm_wait",
+        "state": config["state"],
         "state_data": {"key": key, "label": label},
-        "back": "prompts",
+        "back": config["back"],
     }
     tg.answer_callback(cb_id)
-    tg.send_message(chat, texts.prompt_prompt(label), keyboards.cancel_kb())
+    tg.send_message(chat, config["prompt"](label, hint), keyboards.cancel_kb())
 
 
 def _handle_user(
@@ -654,8 +685,8 @@ CALLBACK_HANDLERS: dict[str, Callable] = {
     "pnav": _handle_pnav,
     "post": _handle_post,
     "src": _handle_src,
-    "set": _handle_set,
-    "prm": _handle_prm,
+    "set": _handle_kv_edit,
+    "prm": _handle_kv_edit,
     "user": _handle_user,
 }
 

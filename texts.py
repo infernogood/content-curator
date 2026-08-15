@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import html
 from datetime import datetime, timezone
 
@@ -187,7 +185,7 @@ def setting_prompt(label: str, hint: str) -> str:
     return f"Изменяем: <b>{label}</b>{hint}\n\nПришли новое значение:"
 
 
-def prompt_prompt(label: str) -> str:
+def prompt_prompt(label: str, hint: str = "") -> str:
     return f"Изменяем: <b>{label}</b>\n\nПришли новый текст промпта (можно в несколько строк)."
 
 
@@ -203,7 +201,7 @@ def top_list(posts: list[dict]) -> str:
     lines = ["<b>Топ контента по рейтингу ИИ</b>\n"]
     for i, post in enumerate(posts, start=1):
         title = html.escape(
-            (post["translated_text"] or post["raw_text"] or "").strip().split("\n")[0][:80]
+            (post["translated_text"] or post["raw_text"] or "").strip().split("\n")[0][:PREVIEW_LEN]
         )
         lines.append(f"{i}. <b>{post['rating']}/10</b> - {title}  <code>#{post['id']}</code>")
     lines.append("\nОткрой «Черновики», чтобы отмодерировать их.")
@@ -213,9 +211,9 @@ def top_list(posts: list[dict]) -> str:
 def mask(value: str) -> str:
     if not value:
         return "<i>(пусто)</i>"
-    if len(value) <= 8:
+    if len(value) <= MASK_SHORT_LEN:
         return "****"
-    return f"{value[:5]}{'*' * 6}{value[-3:]}"
+    return f"{value[:MASK_HEAD]}{'*' * MASK_MIDDLE}{value[-MASK_TAIL:]}"
 
 
 def full_name(from_user: dict) -> str:
@@ -239,35 +237,67 @@ def format_user_line(user: dict) -> str:
     )
 
 
-def render_post_caption(post: dict, source: dict | None) -> str:
+MAX_CAPTION_LEN = 1024  # Telegram: лимит подписи к медиа
+MAX_TEXT_LEN = 4096     # Telegram: лимит текстового сообщения
+
+PREVIEW_LEN = 80
+MASK_SHORT_LEN = 8
+MASK_HEAD = 5
+MASK_MIDDLE = 6
+MASK_TAIL = 3
+
+
+def render_post_caption(
+    post: dict, source: dict | None, limit: int = MAX_CAPTION_LEN,
+) -> str:
     source_label = (
         f"{html.escape(source['title'] or '(без названия)')} [{html.escape(source['type'])}]"
         if source else "(источник удалён)"
     )
+
     raw = (post["raw_text"] or "").strip()
     if len(raw) > 500:
         raw = raw[:500] + "…"
-    raw = html.escape(raw)
-    body = html.escape((post["translated_text"] or "").strip())
-    if not body:
-        body = "<i>(перевод отсутствует)</i>"
+    raw_html = html.escape(raw)
 
     try:
         created = datetime.strptime(post["created_at"], db.DATETIME_ISO)
     except ValueError:
         created = datetime.now(timezone.utc).replace(tzinfo=None)
 
-    lines = [
-        f"<b>Рейтинг:</b> {post['rating']}/10",
-        f"<b>Источник:</b> {source_label}",
-        f"<b>Собран:</b> {created:%Y-%m-%d %H:%M}",
-        "",
-        body,
-    ]
-    if raw:
-        lines += ["", "<b>Оригинал:</b>", f"<blockquote>{raw}</blockquote>"]
-    if post["source_url"]:
-        link = html.escape(post["source_url"], quote=True)
-        lines += ["", f"Ссылка: <a href=\"{link}\">открыть источник</a>"]
-    lines.append(f"\nID <code>#{post['id']}</code>")
-    return "\n".join(lines)
+    def build(body_html: str, include_raw: bool = True) -> str:
+        lines = [
+            f"<b>Рейтинг:</b> {post['rating']}/10",
+            f"<b>Источник:</b> {source_label}",
+            f"<b>Собран:</b> {created:%Y-%m-%d %H:%M}",
+            "",
+            body_html,
+        ]
+        if include_raw and raw_html:
+            lines += ["", "<b>Оригинал:</b>", f"<blockquote>{raw_html}</blockquote>"]
+        if post["source_url"]:
+            link = html.escape(post["source_url"], quote=True)
+            lines += ["", f"Ссылка: <a href=\"{link}\">открыть источник</a>"]
+        lines.append(f"\nID <code>#{post['id']}</code>")
+        return "\n".join(lines)
+
+    body_raw = (post["translated_text"] or "").strip()
+
+    for include_raw in (True, False):
+        max_body = len(body_raw)
+        while True:
+            if max_body <= 0:
+                body_html = "<i>(перевод отсутствует)</i>"
+            elif max_body < len(body_raw):
+                body_html = html.escape(body_raw[:max_body].rstrip("&") + "…")
+            else:
+                body_html = html.escape(body_raw)
+            caption = build(body_html, include_raw)
+            if len(caption) <= limit:
+                return caption
+            if max_body <= 0:
+                break
+            max_body //= 2
+
+    # Без тела и без оригинала подпись всегда меньше 1024.
+    return build("<i>(перевод отсутствует)</i>", include_raw=False)
