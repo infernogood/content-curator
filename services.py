@@ -250,6 +250,16 @@ MIN_TEXT_LENGTH = 30
 MAX_FEED_ITEMS = 15
 
 
+def _html_to_text(html_text: str) -> str:
+    """Превращает HTML-описание из RSS в плоский текст: убирает теги и сущности."""
+    if not html_text:
+        return ""
+    cleaned = html.unescape(html_text)
+    cleaned = re.sub(r"<[^>]+>", "\n", cleaned)
+    lines = [line.strip() for line in cleaned.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
 def collect_rss(source: dict, owner_id: int) -> list[CollectedItem]:
     feed_url = source["identifier"].strip()
     parsed = feedparser.parse(feed_url)
@@ -259,8 +269,8 @@ def collect_rss(source: dict, owner_id: int) -> list[CollectedItem]:
 
     entries: list[CollectedItem] = []
     for entry in parsed.entries[:MAX_FEED_ITEMS]:
-        title = (entry.get("title") or "").strip()
-        summary = (entry.get("summary") or entry.get("description") or "").strip()
+        title = _html_to_text(entry.get("title") or "")
+        summary = _html_to_text(entry.get("summary") or entry.get("description") or "")
         link = (entry.get("link") or feed_url).strip()
 
         raw_text = (title + "\n\n" + summary).strip() if title and summary else (title or summary)
