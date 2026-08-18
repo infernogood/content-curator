@@ -247,6 +247,13 @@ MASK_MIDDLE = 6
 MASK_TAIL = 3
 
 
+def truncate(text: str, limit: int) -> str:
+    """Обрезает текст до limit символов, не обрывая хвост на неполной HTML-сущности."""
+    if len(text) <= limit:
+        return text
+    return text[:limit - 1].rstrip("&") + "…"
+
+
 def render_post_caption(
     post: dict, source: dict | None, limit: int = MAX_CAPTION_LEN,
 ) -> str:
@@ -255,9 +262,7 @@ def render_post_caption(
         if source else "(источник удалён)"
     )
 
-    raw = (post["raw_text"] or "").strip()
-    if len(raw) > 500:
-        raw = raw[:500] + "…"
+    raw = truncate((post["raw_text"] or "").strip(), 500)
     raw_html = html.escape(raw)
 
     try:
@@ -281,15 +286,19 @@ def render_post_caption(
         lines.append(f"\nID <code>#{post['id']}</code>")
         return "\n".join(lines)
 
-    body_raw = (post["translated_text"] or "").strip()
+    translated = (post["translated_text"] or "").strip()
+    body_raw = translated or raw
 
+    # Перевод пуст - тело из оригинала, блок «Оригинал» не дублируем.
     for include_raw in (True, False):
+        if include_raw and not translated:
+            continue
         max_body = len(body_raw)
         while True:
             if max_body <= 0:
                 body_html = "<i>(перевод отсутствует)</i>"
             elif max_body < len(body_raw):
-                body_html = html.escape(body_raw[:max_body].rstrip("&") + "…")
+                body_html = html.escape(truncate(body_raw, max_body))
             else:
                 body_html = html.escape(body_raw)
             caption = build(body_html, include_raw)

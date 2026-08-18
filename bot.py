@@ -490,10 +490,10 @@ def _publish_post(
         tg.answer_callback(cb_id, texts.POST_NOT_FOUND, show_alert=True)
         return
 
-    text = post["translated_text"] or ""
+    text = post["translated_text"] or post["raw_text"] or ""
     has_media = _has_media(post)
-    if has_media and len(text) > texts.MAX_CAPTION_LEN:
-        text = text[:texts.MAX_CAPTION_LEN - 1].rstrip("&") + "…"
+    limit = texts.MAX_CAPTION_LEN if has_media else texts.MAX_TEXT_LEN
+    text = texts.truncate(text, limit)
     if has_media:
         published = tg.send_media(
             channel_id, post["media_file_id"], post["media_type"], html.escape(text),

@@ -38,6 +38,7 @@ log = logging.getLogger(__name__)
 
 LLM_RAW_TEXT_LIMIT = 8000
 LLM_SUMMARY_LIMIT = 2000
+CAPTION_OVERHEAD = 100  # запас на шапку, разделители и ID внутри caption
 
 
 class MediaSender(Protocol):
@@ -356,8 +357,8 @@ def process_collected(
             raw_text=collected.raw_text, translated_text=summary, rating=rating,
             dedup_hash=dedup_hash, media_type=media_type, status=POST_STATUS_DRAFT,
         )
-        log.info("Коллектор: создан черновик #%s (user=%s, rating=%d)",
-                 post["id"], owner_id, rating)
+        log.info("Коллектор: создан черновик #%s (user=%s, rating=%d, text_len=%d)",
+                 post["id"], owner_id, rating, len(summary))
 
         user = db.get_user(owner_id)
         if user is None:
@@ -367,13 +368,14 @@ def process_collected(
                 pid, status=POST_STATUS_DRAFT, has_prev=False, has_next=False, offset=0,
             )
 
-        summary_shown = summary
-        if media_path is not None and len(summary_shown) > texts.MAX_CAPTION_LEN - 100:
-            summary_shown = summary_shown[:texts.MAX_CAPTION_LEN - 101].rstrip("&") + "…"
+        caption_limit = (
+            texts.MAX_CAPTION_LEN if media_path is not None else texts.MAX_TEXT_LEN
+        ) - CAPTION_OVERHEAD
+        caption_body = texts.truncate(summary or collected.raw_text, caption_limit)
         caption = (
             f"<b>Новый черновик</b>  ·  {rating}/10\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"{html.escape(summary_shown)}\n"
+            f"{html.escape(caption_body)}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"ID #{post['id']}"
         )
