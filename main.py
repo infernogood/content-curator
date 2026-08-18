@@ -22,7 +22,7 @@ def configure_logging() -> None:
 def main() -> None:
     configure_logging()
     log = logging.getLogger(__name__)
-    log.info("=== ContentCurator (easy) startup ===")
+    log.info("ContentCurator: запуск")
 
     ensure_runtime_dirs()
     db.init_db()

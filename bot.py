@@ -48,17 +48,17 @@ class Telegram:
         return API_BASE.format(token=self.token, method=method)
 
     def _request(
-        self, method: str, payload: dict, files: dict | None = None, timeout: int = 60,
+        self, method: str, body: dict, files: dict | None = None, timeout: int = 60,
     ) -> dict | None:
         try:
             if files:
                 multipart_data = {
                     key: (json.dumps(value) if isinstance(value, dict) else value)
-                    for key, value in payload.items()
+                    for key, value in body.items()
                 }
                 resp = requests.post(self._url(method), data=multipart_data, files=files, timeout=timeout)
             else:
-                resp = requests.post(self._url(method), json=payload, timeout=timeout)
+                resp = requests.post(self._url(method), json=body, timeout=timeout)
         except requests.RequestException as exc:
             log.warning("API %s: сетевой сбой: %s", method, exc)
             return None
@@ -83,48 +83,48 @@ class Telegram:
         return self._request("getMe", {})
 
     def get_updates(self, offset: int) -> list[dict]:
-        payload = {
+        body = {
             "offset": offset,
             "timeout": 25,
             "allowed_updates": ["message", "callback_query"],
         }
-        updates = self._request("getUpdates", payload, timeout=60)
+        updates = self._request("getUpdates", body, timeout=60)
         return updates or []
 
     def send_message(
         self, chat_id, text: str, reply_markup: dict | None = None,
     ) -> dict | None:
-        payload: dict[str, Any] = {
+        body: dict[str, Any] = {
             "chat_id": chat_id, "text": text, "parse_mode": "HTML",
         }
         if reply_markup is not None:
-            payload["reply_markup"] = reply_markup
-        return self._request("sendMessage", payload)
+            body["reply_markup"] = reply_markup
+        return self._request("sendMessage", body)
 
     def answer_callback(self, cb_id: str, text: str | None = None, show_alert: bool = False) -> None:
-        payload: dict[str, Any] = {"callback_query_id": cb_id}
+        body: dict[str, Any] = {"callback_query_id": cb_id}
         if text:
-            payload["text"] = text[:CALLBACK_ALERT_MAX_LEN]
+            body["text"] = text[:CALLBACK_ALERT_MAX_LEN]
         if show_alert:
-            payload["show_alert"] = True
-        self._request("answerCallbackQuery", payload)
+            body["show_alert"] = True
+        self._request("answerCallbackQuery", body)
 
     def edit_message_text(
         self, chat_id, message_id: int, text: str, reply_markup: dict | None = None,
     ) -> None:
-        payload = {
+        body = {
             "chat_id": chat_id, "message_id": message_id,
             "text": text, "parse_mode": "HTML",
         }
         if reply_markup is not None:
-            payload["reply_markup"] = reply_markup
-        self._request("editMessageText", payload)
+            body["reply_markup"] = reply_markup
+        self._request("editMessageText", body)
 
     def edit_reply_markup(self, chat_id, message_id: int, reply_markup: dict | None = None) -> None:
-        payload = {"chat_id": chat_id, "message_id": message_id}
+        body = {"chat_id": chat_id, "message_id": message_id}
         if reply_markup is not None:
-            payload["reply_markup"] = reply_markup
-        self._request("editMessageReplyMarkup", payload)
+            body["reply_markup"] = reply_markup
+        self._request("editMessageReplyMarkup", body)
 
     def delete_message(self, chat_id, message_id: int) -> None:
         self._request("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
@@ -149,15 +149,15 @@ class Telegram:
 
         media_ref = str(media_path_or_id) if media_path_or_id else ""
 
-        payload: dict[str, Any] = {"chat_id": chat_id, "parse_mode": "HTML", "caption": caption}
+        body: dict[str, Any] = {"chat_id": chat_id, "parse_mode": "HTML", "caption": caption}
         if reply_markup is not None:
-            payload["reply_markup"] = reply_markup
+            body["reply_markup"] = reply_markup
 
         if media_ref and os.path.exists(media_ref):
             with open(media_ref, "rb") as fh:
-                return self._request(method, payload, files={field: fh}, timeout=120)
-        payload[field] = media_ref
-        return self._request(method, payload)
+                return self._request(method, body, files={field: fh}, timeout=120)
+        body[field] = media_ref
+        return self._request(method, body)
 
     def send_new_post(
         self, chat_id, caption: str, media_path_or_id, reply_markup: dict | None = None,
@@ -619,27 +619,27 @@ def _handle_kv_edit(
     tg: Telegram, chat: int, message_id: int, cb_id: str,
     user: dict, segments: list[str], fsms: dict,
 ) -> None:
-    config = KV_CALLBACKS.get(segments[0])
-    if config is None:
+    editor = KV_CALLBACKS.get(segments[0])
+    if editor is None:
         tg.answer_callback(cb_id)
         return
 
     key = segments[1]
-    label = dict(config["pairs"]).get(key)
+    label = dict(editor["pairs"]).get(key)
     if label is None:
-        tg.answer_callback(cb_id, config["unknown"], show_alert=True)
+        tg.answer_callback(cb_id, editor["unknown"], show_alert=True)
         return
 
-    hint_builder = config["hint"]
+    hint_builder = editor["hint"]
     hint = hint_builder(key) if hint_builder else ""
 
     fsms[user["telegram_id"]] = {
-        "state": config["state"],
+        "state": editor["state"],
         "state_data": {"key": key, "label": label},
-        "back": config["back"],
+        "back": editor["back"],
     }
     tg.answer_callback(cb_id)
-    tg.send_message(chat, config["prompt"](label, hint), keyboards.cancel_kb())
+    tg.send_message(chat, editor["prompt"](label, hint), keyboards.cancel_kb())
 
 
 def _handle_user(

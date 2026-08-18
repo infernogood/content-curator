@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Protocol
+from urllib.parse import ParseResult, parse_qs, urlparse
 
 import feedparser
 import requests
@@ -22,6 +23,7 @@ from config import (
     MEDIA_TYPE_PHOTO,
     MEDIA_TYPE_TEXT,
     MEDIA_TYPE_VIDEO,
+    MIN_MEDIA_DIMENSION,
     POST_STATUS_DRAFT,
     SETTING_AI_API_KEY,
     SETTING_AI_BASE_URL,
@@ -35,6 +37,13 @@ from config import (
 )
 
 log = logging.getLogger(__name__)
+
+try:
+    from PIL import Image
+    from PIL.Image import DecompressionBombError
+except ImportError:
+    Image = None
+    DecompressionBombError = None
 
 LLM_RAW_TEXT_LIMIT = 8000
 LLM_SUMMARY_LIMIT = 2000
@@ -56,7 +65,14 @@ MIME_TO_EXT: dict[str, str] = {
     "video/quicktime": ".mov",
 }
 
-_IMG_RE = re.compile(r'<img[^>]+(?:src|data-src)=["\']([^"\'>\s]+)["\']', re.IGNORECASE)
+_IMG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+_IMG_SRC_RE = re.compile(r"\b(?:data-src|src)\s*=\s*[\"']([^\"'>\s]+)[\"']", re.IGNORECASE)
+_IMG_SRCSET_RE = re.compile(r"\bsrcset\s*=\s*([\"'])([^\"']*)\1", re.IGNORECASE)
+
+_THUMB_MARKER_RE = re.compile(
+    r"(thumbnail|thumb|small|_s\.|/s\d+x\d+/|-\d+x\d+\.(?:jpe?g|png|webp|gif))",
+    re.IGNORECASE,
+)
 
 MAX_DOWNLOAD_BYTES: int = 20 * 1024 * 1024
 
@@ -130,6 +146,31 @@ def classify_media(path: Path | str) -> str:
     return MEDIA_TYPE_DOCUMENT
 
 
+def _is_media_too_small(path: Path | str) -> bool:
+    """Проверяет длинную сторону растрового изображения по MIN_MEDIA_DIMENSION.
+
+    Проверка применяется только к jpg/jpeg/png/webp. Для gif, видео и документов
+    (а также при отсутствии Pillow) всегда возвращает False - файл проходит дальше.
+    """
+    ext = Path(path).suffix.lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+        return False
+    if Image is None:
+        log.info("Коллектор: Pillow недоступна - проверка размеров пропущена")
+        return False
+    try:
+        with Image.open(path) as img:
+            width, height = img.size
+    except DecompressionBombError as exc:
+        log.warning("Коллектор: файл %s превышает лимит пикселей, отброшен: %s", Path(path).name, exc)
+        return True
+    except (OSError, ValueError) as exc:
+        log.warning("Коллектор: размеры файла %s не прочитаны: %s", Path(path).name, exc)
+        return False
+    log.info("Коллектор: размеры файла %s: %dx%d", Path(path).name, width, height)
+    return max(width, height) < MIN_MEDIA_DIMENSION
+
+
 def _llm_chat(
     base_url: str, api_key: str, model: str,
     system_prompt: str, user_content: str, temperature: float,
@@ -140,7 +181,7 @@ def _llm_chat(
         return ""
 
     url = base_url.rstrip("/") + "/chat/completions"
-    payload = {
+    body = {
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -151,7 +192,7 @@ def _llm_chat(
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=60)
+        resp = requests.post(url, json=body, headers=headers, timeout=60)
     except requests.RequestException as exc:
         log.warning("LLM %s: сетевой сбой: %s", model, exc)
         return ""
@@ -278,19 +319,67 @@ def collect_rss(source: dict, owner_id: int) -> list[CollectedItem]:
             continue
 
         img_urls = _extract_image_urls(entry)
-        media_url = img_urls[0] if img_urls else None
         entries.append(CollectedItem(
             source_id=source["id"], source_url=link, raw_text=raw_text,
-            media_urls=[media_url] if media_url else [],
-            media_type_hint=MEDIA_TYPE_PHOTO if media_url else MEDIA_TYPE_TEXT,
+            media_urls=img_urls,
+            media_type_hint=MEDIA_TYPE_PHOTO if img_urls else MEDIA_TYPE_TEXT,
         ))
     return entries
 
 
-def _extract_image_urls(feed_entry: dict) -> list[str]:
-    img_urls: list[str] = []
+def _srcset_best(srcset: str) -> tuple[str | None, int]:
+    """Из srcset возвращает URL с максимальным размером и сам размер.
 
-    # Обложка поста часто лежит во вложении (enclosure) с image-типом или картинкой-ссылкой.
+    Размером считается числовое значение дескриптора (320w, 2x и т.п.).
+    """
+    best_url = None
+    best_size = -1
+    for part in srcset.split(","):
+        tokens = part.strip().split()
+        if not tokens:
+            continue
+        url = tokens[0]
+        size = 0
+        if len(tokens) > 1:
+            desc_match = re.search(r"\d+", tokens[-1])
+            if desc_match:
+                size = int(desc_match.group(0))
+        if size > best_size:
+            best_size = size
+            best_url = url
+    return best_url, max(best_size, 0)
+
+
+def _query_has_small_size(parsed: ParseResult) -> bool:
+    """Ищет в query-параметрах w/h/width/height значения меньше MIN_MEDIA_DIMENSION."""
+    for name, values in parse_qs(parsed.query).items():
+        if name.lower() not in {"w", "h", "width", "height"}:
+            continue
+        for value in values:
+            size = parse_int(value)
+            if 0 < size < MIN_MEDIA_DIMENSION:
+                return True
+    return False
+
+
+def _url_is_thumbnail_like(url: str) -> bool:
+    """Определяет признаки миниатюры в URL: маркеры в пути или малые размеры в query."""
+    parsed = urlparse(url)
+    if _THUMB_MARKER_RE.search(parsed.path):
+        return True
+    return _query_has_small_size(parsed)
+
+
+def _extract_image_urls(feed_entry: dict) -> list[str]:
+    """Собирает URL изображений из записи фида, отсортированные по ожидаемому качеству.
+
+    Приоритет источников: enclosures (обычно оригинал), media_content с явными
+    размерами (по площади width*height), media_content без размеров, <img> из HTML
+    (по максимальному размеру из srcset), media_thumbnail. URL с признаками
+    миниатюры понижаются в приоритете, но не отбрасываются.
+    """
+    candidates: list[tuple[int, int, str]] = []
+
     for enc in feed_entry.get("enclosures", []) or []:
         href = enc.get("href")
         is_image = (enc.get("type") or "").lower().startswith("image/")
@@ -298,29 +387,56 @@ def _extract_image_urls(feed_entry: dict) -> list[str]:
             (".jpg", ".jpeg", ".png", ".webp", ".gif")
         )
         if href and (is_image or has_image_ext):
-            img_urls.append(href)
+            candidates.append((100, 0, href))
 
     for media in feed_entry.get("media_content", []) or []:
-        img_urls.append(media.get("url"))
-    for media in feed_entry.get("media_thumbnail", []) or []:
-        img_urls.append(media.get("url"))
+        url = media.get("url")
+        if not url:
+            continue
+        width = parse_int(media.get("width"))
+        height = parse_int(media.get("height"))
+        if width > 0 and height > 0:
+            candidates.append((95, width * height, url))
+        else:
+            candidates.append((90, 0, url))
 
-    # Часть фидов держит картинку только в HTML-описании, а data-src появляется при ленивой загрузке.
+    for media in feed_entry.get("media_thumbnail", []) or []:
+        url = media.get("url")
+        if url:
+            candidates.append((80, 0, url))
+
     html_parts = [feed_entry.get("summary") or "", feed_entry.get("description") or ""]
     content = feed_entry.get("content") or []
     if content:
         html_parts.append(content[0].get("value") or "")
-    img_urls += _IMG_RE.findall(" ".join(html_parts))
+    for tag in _IMG_RE.findall(" ".join(html_parts)):
+        url = None
+        img_size = 0
+        srcset_match = _IMG_SRCSET_RE.search(tag)
+        if srcset_match:
+            url, img_size = _srcset_best(srcset_match.group(2))
+        if url is None:
+            src_match = _IMG_SRC_RE.search(tag)
+            if src_match:
+                url = src_match.group(1)
+        if url:
+            candidates.append((85, img_size, url))
 
-    unique_urls: list[str] = []
-    for url in img_urls:
+    # Миниатюрные URL понижаются в приоритете, но не выкидываются - иначе пропадёт единственная картинка.
+    filtered: list[tuple[int, int, str]] = []
+    for priority, extra, url in candidates:
         if not isinstance(url, str):
             continue
         if not (url.startswith("http://") or url.startswith("https://")):
             continue
-        if url in unique_urls:
-            continue
-        unique_urls.append(url)
+        if _url_is_thumbnail_like(url):
+            priority -= 1
+        filtered.append((priority, extra, url))
+
+    unique_urls: list[str] = []
+    for _, _, url in sorted(filtered, key=lambda c: (-c[0], -c[1])):
+        if url not in unique_urls:
+            unique_urls.append(url)
     return unique_urls
 
 
@@ -355,11 +471,18 @@ def process_collected(
             media_path = collected.media_paths[0]
         elif collected.media_urls:
             user_agent = db.get_effective(owner_id, SETTING_DOWNLOAD_UA, DEFAULT_DOWNLOAD_UA)
-            media_path = download(collected.media_urls[0], headers={"User-Agent": user_agent})
-            if media_path:
-                log.info("Коллектор: медиа скачано: %s", media_path)
-            else:
-                log.warning("Коллектор: медиа не скачано: %s", collected.media_urls[0])
+            for url in collected.media_urls:
+                candidate = download(url, headers={"User-Agent": user_agent})
+                if candidate is None:
+                    log.warning("Коллектор: кандидат недоступен, следующий: %s", url)
+                    continue
+                if _is_media_too_small(candidate):
+                    log.warning("Коллектор: кандидат отброшен по размеру, следующий: %s", url)
+                    cleanup(candidate)
+                    continue
+                media_path = candidate
+                log.info("Коллектор: медиа скачано: %s (%s)", url, media_path.name)
+                break
 
         media_type = classify_media(media_path) if media_path else MEDIA_TYPE_TEXT
         post = db.create_post(
@@ -384,9 +507,9 @@ def process_collected(
         caption_body = texts.truncate(summary or collected.raw_text, caption_limit)
         caption = (
             f"<b>Новый черновик</b>  ·  {rating}/10\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
+            f"{'-' * 20}\n"
             f"{html.escape(caption_body)}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
+            f"{'-' * 20}\n"
             f"ID #{post['id']}"
         )
         file_id = tg.send_new_post(
