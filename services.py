@@ -329,6 +329,8 @@ def process_collected(
         log.info("Коллектор: дубликат пропущен (user=%s): %s", owner_id, collected.source_url)
         return None
 
+    media_path: Path | None = None
+
     try:
         rating, summary = analyze(owner_id, collected.raw_text)
 
@@ -338,7 +340,6 @@ def process_collected(
                      rating, threshold, owner_id, collected.source_url)
             return None
 
-        media_path: Path | None = None
         if collected.media_paths:
             media_path = collected.media_paths[0]
         elif collected.media_urls:
